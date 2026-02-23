@@ -3,7 +3,7 @@ import os
 import re
 import argparse
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
 
 import torch
@@ -22,10 +22,55 @@ app = FastAPI()
 
 # ----------- Combined Request Schema -----------
 class SearchRequest(BaseModel):
-    queries: List[str]
+    # Backward-compatible request schema:
+    # - query: single query string
+    # - queries: batch queries
+    query: Optional[str] = None
+    queries: Optional[List[str]] = None
     topk_retrieval: Optional[int] = 10
     topk: Optional[int] = 5
     return_scores: bool = False
+
+
+class QueryRequest(BaseModel):
+    query: str
+    topk: Optional[int] = None
+    return_scores: bool = False
+
+
+def _resolve_queries(request: SearchRequest) -> List[str]:
+    """Accept both `query` and `queries` request formats."""
+    if request.queries is not None and len(request.queries) > 0:
+        return request.queries
+    if request.query is not None and str(request.query).strip():
+        return [request.query]
+    return []
+
+
+def _to_legacy_doc(doc: Dict) -> Dict:
+    """
+    Convert retriever doc schema to Search-R1 legacy schema:
+    {"id": "...", "contents": "\"title\"\\ncontent"}
+    """
+    doc_id = doc.get("id", "")
+    if "contents" in doc and doc["contents"] is not None:
+        contents = str(doc["contents"])
+    else:
+        title = str(doc.get("title", "")).strip()
+        content = str(doc.get("content", "")).strip()
+        if title:
+            contents = f"\"{title}\"\n{content}"
+        else:
+            contents = content
+    return {"id": str(doc_id), "contents": contents}
+
+
+def _pack_docs_with_scores(doc_scores: List[Tuple[Dict, float]], topk: int) -> List[Dict]:
+    """Convert [(doc, score), ...] to legacy doc list with score."""
+    packed = []
+    for doc, score in doc_scores[:topk]:
+        packed.append({"document": _to_legacy_doc(doc), "score": float(score)})
+    return packed
 
 # ----------- Reranker Config Schema -----------
 @dataclass
@@ -40,7 +85,10 @@ class RerankerArguments:
 @app.post("/retrieve/rerank")
 def retrieve_with_rerank(request: SearchRequest):
     global retriever, reranker, dataset_name, retriever_topk, cache, use_cache
-    normalized_queries = [normalize_answer(query) for query in request.queries]
+    query_list = _resolve_queries(request)
+    if not query_list:
+        return {"result": []}
+    normalized_queries = [normalize_answer(query) for query in query_list]
     # 存储查询结果
     results = []
     # 记录未命中缓存的查询及其索引
@@ -57,20 +105,20 @@ def retrieve_with_rerank(request: SearchRequest):
             else:
                 # 缓存未命中，添加到待检索列表
                 results.append(None)  # 占位
-                uncached_queries.append(request.queries[i])
+                uncached_queries.append(query_list[i])
                 uncached_indices.append(i)
     else:
         # 不使用缓存时，全部进入检索流程
-        results = [None] * len(request.queries)
-        uncached_queries = list(request.queries)
-        uncached_indices = list(range(len(request.queries)))
+        results = [None] * len(query_list)
+        uncached_queries = list(query_list)
+        uncached_indices = list(range(len(query_list)))
     
     # 如果有未缓存的查询，执行检索
     if uncached_queries:
         # Step 1: 检索文档
         retrieved_docs, scores = retriever.batch_search(
             query_list=uncached_queries,
-            num=10,
+            num=request.topk_retrieval if request.topk_retrieval else retriever_topk,
             return_score=True
         )
         
@@ -83,10 +131,10 @@ def retrieve_with_rerank(request: SearchRequest):
             
             # 处理重排序结果
             doc_scores = reranked.get(0, [])  # 因为只有一个查询，所以用索引0
-            doc_scores = doc_scores[:request.topk]
-            combined = []
-            for doc, score in doc_scores:
-                combined.append({"document": doc, "score": score})
+            if request.return_scores:
+                combined = _pack_docs_with_scores(doc_scores, request.topk if request.topk else 5)
+            else:
+                combined = [_to_legacy_doc(doc) for doc, _score in doc_scores[: (request.topk if request.topk else 5)]]
             
             # 更新结果
             results[idx] = combined
@@ -98,61 +146,31 @@ def retrieve_with_rerank(request: SearchRequest):
     return {"result": results}
 
 @app.post("/retrieve")
-def retrieve_without_rerank(request: SearchRequest):
-    global retriever, reranker, dataset_name, retriever_topk, cache, use_cache
+def retrieve_without_rerank(request: QueryRequest):
+    """
+    Compatible with examples/search/retriever/retrieval_server.py:
+    single query in, wrapped result list out.
+    """
+    global retriever, retriever_topk
 
-    # 存储查询结果
-    results = []
-    # 记录未命中缓存的查询及其索引
-    uncached_queries = []
-    uncached_indices = []
-    normalized_queries = [normalize_answer(query) for query in request.queries]
-    print("request.queries length: ", len(request.queries))
-    hit_count = 0
-    if use_cache:
-        # 首先检查缓存
-        for i, query in enumerate(normalized_queries):
-            cached_result = cache.get(query)
-            if cached_result is not None:
-                # 缓存命中
-                hit_count += 1
-                results.append(cached_result)
-            else:
-                # 缓存未命中，添加到待检索列表
-                results.append(None)  # 占位
-                uncached_queries.append(request.queries[i])
-                uncached_indices.append(i)
-        print("hit_count: ", hit_count)
+    if not request.topk:
+        request.topk = retriever_topk
+
+    if request.return_scores:
+        results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
     else:
-        # 不使用缓存时，全部进入检索流程
-        results = [None] * len(request.queries)
-        uncached_queries = list(request.queries)
-        uncached_indices = list(range(len(request.queries)))
-    # 如果有未缓存的查询，执行检索
-    if uncached_queries:
-        # 检索文档并直接返回
-        retrieved_docs, scores = retriever.batch_search(
-            query_list=uncached_queries,
-            num=request.topk,
-            return_score=True
-        )
-        
-        # 更新结果并缓存
-        for i, idx in enumerate(uncached_indices):
-            single_result = retrieved_docs[i]
-            score_list = scores[i]
-            combined = []
-            for doc, score in zip(single_result, scores[i]):
-                # 将doc中的'contents'字段改为'content'
-                combined.append({"document": doc, "score": score})
-            # 更新结果
-            results[idx] = combined
-            
-            # 缓存结果
-            if use_cache:
-                cache.set(normalized_queries[idx], combined)
+        results = retriever.search(query=request.query, num=request.topk, return_score=False)
+        scores = None
 
-    return {"result": results}
+    resp = []
+    if request.return_scores and scores is not None:
+        combined = []
+        for doc, score in zip(results, scores):
+            combined.append({"document": doc, "score": float(score)})
+        resp.append(combined)
+    else:
+        resp.append(results)
+    return {"result": resp}
 
 def get_reranker(config):
     if config.reranker_type == "sentence_transformer":
