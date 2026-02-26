@@ -161,10 +161,10 @@ def retrieve_without_rerank(request: QueryRequest):
     if request.return_scores and scores is not None:
         combined = []
         for doc, score in zip(results, scores):
-            combined.append({"document": doc, "score": float(score)})
+            combined.append({"document": _to_legacy_doc(doc), "score": float(score)})
         resp.append(combined)
     else:
-        resp.append(results)
+        resp.append([_to_legacy_doc(doc) for doc in results])
     return {"result": resp}
 
 def get_reranker(config):

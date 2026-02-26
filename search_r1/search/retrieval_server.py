@@ -332,6 +332,23 @@ class QueryRequest(BaseModel):
     return_scores: bool = False
 
 
+def _doc_to_legacy(doc: Dict) -> Dict:
+    """
+    统一返回格式：保证 document 含有 contents（训练/客户端期望 document["contents"]）。
+    若 corpus 只有 title/content，则拼成 contents = '"title"\\ncontent'。
+    """
+    if doc is None:
+        return doc
+    if "contents" in doc and doc["contents"] is not None:
+        return doc
+    title = str(doc.get("title", "")).strip()
+    content = str(doc.get("content", "")).strip()
+    contents = f'"{title}"\n{content}' if title else content
+    result = dict(doc)
+    result["contents"] = contents
+    return result
+
+
 app = FastAPI()
 
 @app.post("/retrieve")
@@ -355,17 +372,16 @@ def retrieve_endpoint(request: QueryRequest):
         return_score=request.return_scores
     )
     
-    # Format response
+    # Format response（统一格式：document 含 contents）
     resp = []
     for i, single_result in enumerate(results):
         if request.return_scores:
-            # If scores are returned, combine them with results
             combined = []
             for doc, score in zip(single_result, scores[i]):
-                combined.append({"document": doc, "score": score})
+                combined.append({"document": _doc_to_legacy(doc), "score": score})
             resp.append(combined)
         else:
-            resp.append(single_result)
+            resp.append([_doc_to_legacy(doc) for doc in single_result])
     return {"result": resp}
 
 
