@@ -207,6 +207,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
+    print("[进度] 参数解析完成 (dataset=%s, port=%s, use_cache=%s)." % (args.dataset_name, args.port, args.use_cache))
+    
     # 根据数据集名称设置默认值
     if args.dataset_name == "wiki18_e5" or args.dataset_name == "wiki18_e5_rerank3":
         if not args.index_path:
@@ -264,14 +266,24 @@ if __name__ == "__main__":
     )
     
     # 3) 实例化全局检索器和重排序器
+    print("[进度] 开始加载检索器 (FAISS 索引 + 语料 + 编码器模型)...")
     retriever = get_retriever(config)
+    print("[进度] 检索器加载完成.")
+    print("[进度] 开始加载重排序模型: %s ..." % (reranker_config.rerank_model_name_or_path,))
     reranker = get_reranker(reranker_config)
+    print("[进度] 重排序模型加载完成.")
     dataset_name = args.dataset_name
     retriever_topk = args.topk
     use_cache = args.use_cache
-    cache = SearchCache(
-        dataset_name=dataset_name,
-    ) if use_cache else None
+    if use_cache:
+        print("[进度] 正在初始化缓存 (dataset=%s) ..." % (dataset_name,))
+        cache = SearchCache(
+            dataset_name=dataset_name,
+        )
+        print("[进度] 缓存初始化完成.")
+    else:
+        cache = None
     # 4) 启动服务器
+    print("[进度] 正在启动 HTTP 服务 (host=0.0.0.0, port=%s) ..." % (args.port,))
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=args.port)

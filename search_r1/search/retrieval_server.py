@@ -147,10 +147,15 @@ class BM25Retriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
         from pyserini.search.lucene import LuceneSearcher
+        print("[进度] 正在加载 BM25/Lucene 索引: %s ..." % (self.index_path,))
         self.searcher = LuceneSearcher(self.index_path)
         self.contain_doc = self._check_contain_doc()
         if not self.contain_doc:
+            print("[进度] 正在加载语料: %s ..." % (self.corpus_path,))
             self.corpus = load_corpus(self.corpus_path)
+            print("[进度] 语料加载完成.")
+        else:
+            print("[进度] BM25 索引加载完成 (索引内含文档).")
         self.max_process_num = 8
     
     def _check_contain_doc(self):
@@ -207,14 +212,19 @@ class BM25Retriever(BaseRetriever):
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        print("[进度] 正在加载 FAISS 索引: %s ..." % (self.index_path,))
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
+            print("[进度] 正在将 FAISS 索引迁移到 GPU ...")
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
-
+        print("[进度] FAISS 索引加载完成.")
+        print("[进度] 正在加载语料: %s ..." % (self.corpus_path,))
         self.corpus = load_corpus(self.corpus_path)
+        print("[进度] 语料加载完成.")
+        print("[进度] 正在加载检索编码器模型: %s ..." % (config.retrieval_model_path,))
         self.encoder = Encoder(
             model_name = self.retrieval_method,
             model_path = config.retrieval_model_path,
@@ -222,6 +232,7 @@ class DenseRetriever(BaseRetriever):
             max_length = config.retrieval_query_max_length,
             use_fp16 = config.retrieval_use_fp16
         )
+        print("[进度] 检索编码器模型加载完成.")
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
 
