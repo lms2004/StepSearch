@@ -2,6 +2,7 @@
 import os
 import re
 import argparse
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
@@ -19,8 +20,8 @@ from util import normalize_answer
 
 app = FastAPI()
 
-
-# ----------- Combined Request Schema -----------
+# 全局锁：FAISS GPU 与 retriever/reranker 的 GPU 操作非线程安全，串行化请求
+_retriever_lock = threading.Lock()
 class SearchRequest(BaseModel):
     # Backward-compatible request schema:
     # - query: single query string
@@ -115,33 +116,26 @@ def retrieve_with_rerank(request: SearchRequest):
     
     # 如果有未缓存的查询，执行检索
     if uncached_queries:
-        # Step 1: 检索文档
-        retrieved_docs, scores = retriever.batch_search(
-            query_list=uncached_queries,
-            num=request.topk_retrieval if request.topk_retrieval else retriever_topk,
-            return_score=True
-        )
-        
-        # Step 2: 一个一个进行重排序
-        for i, idx in enumerate(uncached_indices):
-            # 对单个查询进行重排序
-            single_query = [uncached_queries[i]]
-            single_docs = [retrieved_docs[i]]
-            reranked = reranker.rerank(single_query, single_docs)
-            
-            # 处理重排序结果
-            doc_scores = reranked.get(0, [])  # 因为只有一个查询，所以用索引0
-            if request.return_scores:
-                combined = _pack_docs_with_scores(doc_scores, request.topk if request.topk else 5)
-            else:
-                combined = [_to_legacy_doc(doc) for doc, _score in doc_scores[: (request.topk if request.topk else 5)]]
-            
-            # 更新结果
-            results[idx] = combined
-            
-            # 缓存结果
-            if use_cache:
-                cache.set(normalized_queries[idx], combined)
+        with _retriever_lock:
+            # Step 1: 检索文档（FAISS GPU 非线程安全）
+            retrieved_docs, scores = retriever.batch_search(
+                query_list=uncached_queries,
+                num=request.topk_retrieval if request.topk_retrieval else retriever_topk,
+                return_score=True
+            )
+            # Step 2: 重排序（同样使用 GPU，与检索共用一把锁）
+            for i, idx in enumerate(uncached_indices):
+                single_query = [uncached_queries[i]]
+                single_docs = [retrieved_docs[i]]
+                reranked = reranker.rerank(single_query, single_docs)
+                doc_scores = reranked.get(0, [])
+                if request.return_scores:
+                    combined = _pack_docs_with_scores(doc_scores, request.topk if request.topk else 5)
+                else:
+                    combined = [_to_legacy_doc(doc) for doc, _score in doc_scores[: (request.topk if request.topk else 5)]]
+                results[idx] = combined
+                if use_cache:
+                    cache.set(normalized_queries[idx], combined)
     
     return {"result": results}
 
@@ -156,11 +150,12 @@ def retrieve_without_rerank(request: QueryRequest):
     if not request.topk:
         request.topk = retriever_topk
 
-    if request.return_scores:
-        results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
-    else:
-        results = retriever.search(query=request.query, num=request.topk, return_score=False)
-        scores = None
+    with _retriever_lock:
+        if request.return_scores:
+            results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
+        else:
+            results = retriever.search(query=request.query, num=request.topk, return_score=False)
+            scores = None
 
     resp = []
     if request.return_scores and scores is not None:
