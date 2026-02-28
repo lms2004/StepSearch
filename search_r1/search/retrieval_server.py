@@ -9,20 +9,14 @@ import torch
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModel
 from tqdm import tqdm
-import datasets
 
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 def load_corpus(corpus_path: str):
-    corpus = datasets.load_dataset(
-        'json', 
-        data_files=corpus_path,
-        split="train",
-        num_proc=4
-    )
-    return corpus
+    """Load corpus from JSONL file. Uses read_jsonl to avoid datasets LocalFileSystem cache issues."""
+    return read_jsonl(corpus_path)
 
 def read_jsonl(file_path):
     data = []

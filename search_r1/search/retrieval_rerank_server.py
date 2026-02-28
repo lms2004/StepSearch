@@ -39,6 +39,12 @@ class QueryRequest(BaseModel):
     return_scores: bool = False
 
 
+class EmbedRequest(BaseModel):
+    """Request for encoding texts with the retriever's encoder (e.g. E5)."""
+    texts: List[str]
+    is_passage: bool = True  # True = passage encoding (e.g. "passage: ..."); False = query encoding
+
+
 def _resolve_queries(request: SearchRequest) -> List[str]:
     """Accept both `query` and `queries` request formats."""
     if request.queries is not None and len(request.queries) > 0:
@@ -166,6 +172,28 @@ def retrieve_without_rerank(request: QueryRequest):
     else:
         resp.append([_to_legacy_doc(doc) for doc in results])
     return {"result": resp}
+
+
+@app.post("/embed")
+def embed_texts(request: EmbedRequest):
+    """
+    Encode texts using the retriever's encoder (e.g. intfloat/e5-base-v2).
+    Use for information-gain reward: encode gold docs and retrieved docs as passages (is_passage=True).
+    Returns embeddings as list of lists for JSON serialization.
+    """
+    global retriever
+    if not request.texts:
+        return {"embeddings": []}
+    if not hasattr(retriever, "encoder"):
+        return {"error": "embed not available: retriever has no encoder", "embeddings": []}
+    texts = [t.strip() for t in request.texts if t is not None]
+    if not texts:
+        return {"embeddings": []}
+    with _retriever_lock:
+        arr = retriever.encoder.encode(texts, is_query=not request.is_passage)
+    embeddings = arr.tolist()
+    return {"embeddings": embeddings}
+
 
 def get_reranker(config):
     if config.reranker_type == "sentence_transformer":
